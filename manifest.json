@@ -1,0 +1,13 @@
+{
+    "display_name": "Memory Pipeline",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "generate_interceptor": "memoryPipelineInterceptor",
+    "author": "",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false
+}

@@ -1,0 +1,77 @@
+/* Memory Pipeline — Settings Panel Styles */
+
+#memPipeline_settings label {
+    display: block;
+    font-size: 0.85em;
+    opacity: 0.9;
+}
+
+#memPipeline_settings input[type="number"],
+#memPipeline_settings input[type="text"] {
+    background: var(--black70a);
+    border: 1px solid var(--border-color, rgba(255,255,255,0.15));
+    border-radius: 4px;
+    color: inherit;
+    padding: 4px 6px;
+    font-size: 0.9em;
+}
+
+#memPipeline_settings input[type="number"]:focus,
+#memPipeline_settings input[type="text"]:focus {
+    outline: 1px solid var(--border-highlight-color, rgba(255,255,255,0.4));
+}
+
+#memPipeline_status {
+    padding: 4px 0;
+    font-style: italic;
+}
+
+#memPipeline_settings details summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+/* --- v2.1: Advanced prompts & categories --- */
+
+#memPipeline_settings textarea {
+    display: block;
+    width: 100%;
+    min-height: 140px;
+    margin-top: 2px;
+    background: var(--black70a);
+    border: 1px solid var(--border-color, rgba(255,255,255,0.15));
+    border-radius: 4px;
+    color: inherit;
+    padding: 6px;
+    font-family: monospace;
+    font-size: 0.8em;
+    line-height: 1.4;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+#memPipeline_settings textarea:focus {
+    outline: 1px solid var(--border-highlight-color, rgba(255,255,255,0.4));
+}
+
+#memPipeline_settings .memPipeline_resetPrompt {
+    margin: 4px 0 12px;
+}
+
+.memPipeline_catRow {
+    display: grid;
+    grid-template-columns: 1.1fr 1.1fr 2fr auto;
+    gap: 6px;
+    margin-bottom: 6px;
+    align-items: center;
+}
+
+.memPipeline_catRow .mp_cat_remove {
+    padding: 2px 8px;
+    min-width: unset;
+}
+
+#memPipeline_settings code {
+    font-size: 0.95em;
+    opacity: 0.9;
+}
