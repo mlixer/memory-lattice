@@ -6,7 +6,8 @@ compact, encapsulated memories and a maintained fact sheet, instead of
 saving every message as it happens.
 
 This is the **write path** of a two-part memory architecture (the
-"Spatiotemporal Memory Lattice" — full write-up: [coming soon]).
+"Spatiotemporal Memory Lattice" — full write-up: 
+(https://mlixer.github.io/spatiotemporal-memory-lattice/)).
 It pairs with a Qdrant retrieval extension as the **read path**; a
 companion fork with temporal neighbor expansion and cluster-summary
 injection is prepared and awaiting upstream license clearance.
