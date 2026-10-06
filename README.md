@@ -1,5 +1,7 @@
 # Memory Lattice
 
+Part of [The Braid](https://github.com/mlixer/the-braid), a fully local AI companion architecture.
+
 A SillyTavern extension that gives a local AI companion durable,
 long-term memory — by processing each day's conversations into
 compact, encapsulated memories and a maintained fact sheet, instead of
