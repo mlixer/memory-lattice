@@ -1,4 +1,4 @@
-# Memory Pipeline
+# Memory Lattice
 
 A SillyTavern extension that gives a local AI companion durable,
 long-term memory — by processing each day's conversations into
