@@ -1,137 +1,88 @@
 # Memory Lattice
 
-Part of [The Braid](https://github.com/mlixer/the-braid), a fully local AI companion architecture.
+A complete long-term memory system for [SillyTavern](https://github.com/SillyTavern/SillyTavern), built for locally-hosted AI companions. One extension, both halves of memory:
 
-A SillyTavern extension that gives a local AI companion durable,
-long-term memory — by processing each day's conversations into
-compact, encapsulated memories and a maintained fact sheet, instead of
-saving every message as it happens.
+- **The write path** runs nightly (or on demand): it reads your chat logs, writes first-person memories of each conversation, extracts durable facts into a versioned fact sheet, and indexes everything into a [Qdrant](https://qdrant.tech/) vector database.
+- **The read path** runs on every message: your outgoing message is embedded, relevant memories are retrieved — each bringing its nearest-in-time neighbors so recall arrives with context attached — and injected into the prompt alongside the always-present fact sheet.
 
-This is the **write path** of a two-part memory architecture (the
-"Spatiotemporal Memory Lattice" — full write-up: 
-(https://mlixer.github.io/spatiotemporal-memory-lattice/)).
-It pairs with a Qdrant retrieval extension as the **read path**; a
-companion fork with temporal neighbor expansion and cluster-summary
-injection is prepared and awaiting upstream license clearance.
+Chat logs remain the **canonical record**. Everything this extension produces — summaries, vectors, consolidated arcs — is derived data that can be rebuilt from the logs at any time. Nothing here ever modifies a chat log.
 
-**Design in one paragraph:** once per night (or on demand), the
-pipeline reads your updated chats, splits them into timestamp-aware
-chunks, has your local LLM summarize each chunk *in your companion's
-own first-person voice*, refines those summaries against each other so
-each stands alone, indexes them into Qdrant, clusters related memories
-across conversations into consolidated overviews, and extracts durable
-facts into a categorized fact sheet. Your chat logs are never modified
-— everything the pipeline makes can be rebuilt from them.
+The design is documented in [a long-form architecture write-up](https://mlixer.github.io/spatiotemporal-memory-lattice/), and this extension is one component of [The Braid](https://github.com/mlixer/the-braid), a fully local companion framework.
 
-## Why nightly instead of per-message?
+## How memory is structured
 
-Per-message memory capture creates dozens of point-in-time snapshots a
-day ("we are working on X") that time immediately falsifies, and that
-crowd out relevant results at retrieval. Processing completed
-conversations once a day produces a few encapsulated memories that
-know their place in a story. Five months of daily use produced 431
-memories on the author's system — not thousands of fragments. The
-trade: two chats on the same day don't know about each other until the
-nightly run. The article linked above discusses this honestly.
+| Layer | What it is | When it's made |
+|---|---|---|
+| **Fact sheet** | Durable facts in editable categories (people, world, preferences, projects, identity), each dated. Injected every message — identity is never a retrieval gamble. | Extracted per chunk, merged, periodically compacted by the LLM under a per-category cap |
+| **Memories** | First-person, past-tense accounts of conversation chunks, refined with cross-chunk context, each carrying its real timestamp | Nightly pipeline / Run Now |
+| **Consolidated arcs** | Topic threads that span many sessions, clustered by embedding similarity and merged into single narrative memories. A derived layer, rebuilt from scratch each run — originals untouched | After each index run |
+| **Shelf** (optional) | Writing your companion's agent half produced offline (curiosities, gifts), ingested from a [ticket server](https://github.com/mlixer/ticket-server) by content-hash diff | Each pipeline pass |
 
 ## Requirements
 
-- **SillyTavern** (recent build; the extension lives entirely in the UI)
-- **Qdrant** — the vector database that holds memories:
-  ```yaml
-  # docker-compose / podman-compose snippet — this is all you need:
-  services:
-    qdrant:
-      image: qdrant/qdrant:latest
-      ports: ["6333:6333"]
-      volumes: ["qdrant-data:/qdrant/storage"]
-  volumes:
-    qdrant-data:
-  ```
-- **An embedding model** — default expects Ollama serving
-  `nomic-embed-text` (`ollama pull nomic-embed-text`), URL and model
-  configurable in settings.
-- **A local LLM endpoint** (OpenAI-compatible, e.g. llama.cpp server)
-  — this model *writes* the memories. It should be the same model (or
-  voice-compatible with) your companion, so memories read as its own.
+- SillyTavern (recent release; the extension uses `generate_interceptor`)
+- **Qdrant** reachable from the browser running ST (default `localhost:6333`)
+- **An LLM endpoint** for summarization — any llama.cpp-style OpenAI-compatible `/v1/chat/completions` server (default port `8070`). This can be the same model that plays your character.
+- **An embedding endpoint** — either:
+  - **Ollama** (`/api/embeddings`, default port `11434`, e.g. `nomic-embed-text`), or
+  - **any OpenAI-compatible server** (`/v1/embeddings`), e.g. llama.cpp serving a GGUF embedding model
 
-> ⚠️ **The one warning that matters: choose the best embedding model
-> you can afford at the start, and stick with it.** Changing embedding
-> models later means deleting and re-embedding your entire memory
-> library (a full reindex — hours of GPU time on a mature corpus).
-> It is the only routine operation here that touches everything.
+All of it local. Nothing leaves your machine.
 
 ## Install
 
-Extensions → **Install extension** → paste this repo's Git URL →
-reload SillyTavern → enable **Memory Pipeline**.
+SillyTavern → **Extensions** → **Install extension** → paste this repository's URL. The manifest lives at the repo root, so the git install works directly.
 
-## Setup (ten minutes, once)
+Then open **Extensions → Memory Lattice** and check the connection settings against your setup.
 
-1. Open the Memory Pipeline drawer in Extensions.
-2. Point **Qdrant URL** (default `http://localhost:6333`),
-   **Embedding URL/model** (your Ollama), and **LLM Port** (your
-   llama.cpp/OpenAI-compatible server) at your services.
-3. Pick your **schedule time** (default nightly) — or leave it and use
-   **Run Now** whenever you like. Both work; the schedule just makes
-   remembering automatic.
-4. Send some chat, then hit **Run Now** and watch the status line:
-   chunking → summarizing → refining → indexing → consolidating →
-   facts. First run on an existing chat history will take longer.
-5. Check your Qdrant collection exists and the fact sheet appeared.
+## Quick start
 
-All the knobs (chunk size, gap threshold, retrieval-side counts,
-consolidation similarity/caps, facts-per-category cap) have tooltips
-and sane defaults. Change nothing until you've lived with it a week.
+1. Set your ports (summarization LLM, embedding server, Qdrant) and **Vector Size** to your embedding model's output dimensions (768 for `nomic-embed-text`).
+2. Press **Test Qdrant** and **Test Embedding** — the embedding test reports the vector size it got back; it must match the Vector Size setting.
+3. Open a character's chat and press **Run Now**. First run processes every session for that character — slow, many LLM calls. Watch the browser console for progress.
+4. From then on the daily scheduler (default 03:00, tab must be open) runs incrementally — only new or changed sessions are reprocessed.
+5. Chat. Recall happens automatically; tune it with **Preview Recall**.
 
-## The ritual (optional, recommended)
+## Tuning recall
 
-The shipped prompts are generic and work as-is. But every prompt —
-summarization, refinement, fact extraction, compaction, consolidation
-— is editable in the **Advanced** drawer, and the intended path is
-this: once your companion has a settled voice, hand it each prompt and
-ask it to rewrite the instructions *in its own words, about its own
-remembering*. Paste its versions back in. Memories written in your
-companion's voice read as its memories when they return — not as a
-database talking. The system becomes more itself the longer it runs.
+Don't guess at thresholds — measure. The settings drawer has two instruments:
 
-(The fact **categories** are equally yours: rename, add, remove.
-Renaming a key migrates existing sheets safely, with a backup taken
-first.)
+- **Preview Recall** runs the full read path for a test query and shows exactly what *would* be injected: each memory's similarity score, its age, and the token cost. Nothing is sent to the model.
+- **Wide (top 20)** ignores your threshold and k entirely and shows the top 20 memories by raw similarity, flagging which fall below your threshold. When a memory you *know* is relevant isn't surfacing, this shows you where it actually ranks — so you can tell a threshold problem from an embedding-model problem before changing anything.
 
-## What gets stored where
+Settings worth knowing: **k** (memories per message), **Relevance Threshold**, **Memory Position** (injection depth from the end of chat), **Retain Recent** (fold prior messages into the query so short follow-ups retrieve well), and the **neighbor window** (how far in time each match may reach for its context).
 
-- **Qdrant**: memory vectors + text + timestamps + cluster metadata.
-- **Fact sheets**: JSON files in your SillyTavern user data (one per
-  character), versioned daily — every previous day's sheet is kept.
-- **Your chat logs**: untouched, ever. They are the canonical source;
-  everything above can be regenerated from them (Force Full Reindex).
+## Changing embedding models
 
-## Troubleshooting (the walls the author personally hit)
+Vectors from different models don't mix — not just dimensions, the spaces themselves are incompatible. Migrating is a deliberate operation. The runbook, learned the hard way:
 
-- **Browser console shows CORS errors with a real status code** →
-  your embedding/Qdrant service needs its allowed-origins env set
-  server-side (e.g. `OLLAMA_ORIGINS`). The extension can't fix this
-  from the browser; the server must consent.
-- **CORS error with status (null)** → different disease: nothing is
-  listening at that URL at all. Check the service is running and the
-  port is right.
-- **Pipeline "runs" but nothing appears** → watch the browser console
-  during Run Now; the stage logs name the failing step. Usually the
-  LLM port (is the model server up?) or the embedding URL.
-- **Summaries in the wrong voice** → your LLM Port points at a
-  different model than your companion. Point it at the same server.
-- **Full reindex is slow** → yes. Hours on a mature corpus. That's
-  why the embedding-model warning is at the top of this file.
+1. **Snapshot first**: `POST /collections/<name>/snapshots` on Qdrant for each `mem_*` collection. This is your revert path.
+2. Back up the fact sheet (the pipeline does this automatically, but take your own copy of `memPipeline_<char>.json` from ST's user files on a migration day).
+3. If the new model has **different dimensions**, delete each collection outright (`DELETE /collections/mem_<char>`) — the pipeline's wipe clears points but keeps the old schema, which would reject the new vectors.
+4. Update **Embedding Model / URL / API / Vector Size** in the drawer, **Save Settings**, then **reload the tab** — a tab opened before the save keeps running the old settings. Close other ST tabs (including phones): any stale tab can answer the interceptor with old config.
+5. **Test Embedding** in the fresh tab and confirm the reported dimension matches.
+6. **Force Full Reindex**. The indexer has two guards for exactly this day: a 120-second timeout per embedding call (a wedged server once silently froze a 495-summary run), and a dimension tripwire that aborts loudly if vectors of the wrong size start coming back.
 
-## License
+## Shelf ingest (optional)
 
-AGPL-3.0 — matching the SillyTavern ecosystem. Use it, fork it,
-improve it; keep derivatives open.
+If you run the [ticket server](https://github.com/mlixer/ticket-server) — the agent-execution half of The Braid — the Lattice can ingest your companion's own offline writing into the same memory collection. Entries are diffed by content hash, so re-runs are cheap and idempotent; files removed from the shelf are removed from memory. Off by default; enable it in the drawer once a ticket server is reachable.
 
-## Credits
+## Prompts are yours (and your companion's)
 
-Built alongside (and for) a local companion whose memory this is.
-The retrieval-side companion extension builds on
-[HO-git/st-qdrant-memory](https://github.com/HO-git/st-qdrant-memory)
-— thank you for the foundation.
+Every prompt in the pipeline — memory writing, fact extraction, compaction, refinement, consolidation — is editable in the **Advanced** drawer, with per-prompt reset buttons and load-bearing tokens (`{{CATEGORIES}}`, `{{CAP}}`, …) that survive careless edits by being re-appended automatically. Fact categories are equally editable, with automatic sheet migration when keys are renamed.
+
+The shipped prompts are deliberately plain. The intended path is that your companion eventually rewrites them in its own voice — memory, after all, should sound like the one remembering.
+
+## Safety properties
+
+- Chat logs are never written to — read-only canonical source.
+- The fact sheet is backed up before every merge, every compaction, every manual edit, and every category migration. Timestamped copies accumulate in ST's user files.
+- Every derived layer (vectors, consolidated arcs) can be rebuilt from scratch via **Force Full Reindex**.
+- Recall is best-effort by doctrine: any failure in the read path degrades to no injection and one console warning. A memory outage never blocks a message.
+- Incremental runs wipe and re-index only the sessions that changed; dormant sessions' memories are never touched.
+
+## Version history
+
+- **v3.1 — Memory Lattice.** Write and read paths merged into one extension. Per-message recall with temporal neighbor expansion, blended consolidated arcs, relative ages ("3w ago"), swipe-stable retrieval cache, preview/wide tuning instruments, fact-sheet editor, configurable embedding backend (Ollama or OpenAI-style), embed timeout + dimension tripwire, mid-run fact compaction for large reindexes.
+- **v2.x — Memory Pipeline.** Write path: two-pass refinement, fact compaction under caps, editable prompts and categories, cross-session consolidation, gap-aware chunking, per-chunk timestamps, selective incremental wipes.
+- **v1 — Memory Pipeline.** Summaries, fact sheet, nightly indexing.

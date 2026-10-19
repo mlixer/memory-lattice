@@ -1,8 +1,10 @@
 // =============================================================================
-// index.js — Memory Pipeline: SillyTavern Extension Entry Point
+// index.js — Memory Lattice: SillyTavern Extension Entry Point
 // =============================================================================
-// Wires together summarizer.js, factSheet.js, and qdrantIndexer.js into a
-// complete managed memory system for SillyTavern.
+// Wires together the WRITE PATH (summarizer.js, factSheet.js,
+// qdrantIndexer.js, consolidator.js — the nightly pipeline, plus
+// shelfIngest.js, Phase 4) and the READ PATH (reader.js — per-message
+// recall) into one complete memory system.
 //
 // Responsibilities:
 //   1. Register extension with ST and initialise settings
@@ -11,6 +13,10 @@
 //   4. Run the daily scheduler
 //   5. Orchestrate the full pipeline: load → summarise → index → save
 //   6. Track which characters have been indexed (for scheduled runs)
+//   7. Per-message injection: recalled memories + the fact sheet
+//
+// NOTE: the internal settings key remains 'memoryPipeline' so existing
+// installs keep their settings across the rename to Memory Lattice.
 // =============================================================================
 
 // ST extensions live at /scripts/extensions/third-party/[name]/
@@ -34,6 +40,13 @@ import { loadFactSheet, saveFactSheet, finaliseAndSave,
          getLastIndexed,
          backupFactSheet, pruneOldBackups }     from './factSheet.js';
 import { indexSummaries }                       from './qdrantIndexer.js';
+import { indexShelfForCharacter }                from './shelfIngest.js';
+import { DEFAULT_READER_SETTINGS,
+         injectRecalledMemories,
+         previewRecall,
+         countMemories,
+         testQdrantConnection,
+         testEmbeddingConnection }              from './reader.js';
 import { runConsolidation,
          DEFAULT_CONSOLIDATE_PROMPT }           from './consolidator.js';
 
@@ -42,6 +55,9 @@ import { runConsolidation,
 // =============================================================================
 
 const EXTENSION_NAME = 'memoryPipeline';
+// In-array marker for the interceptor's fact-sheet injection (double-call
+// guard). Distinct from reader.js's recall marker and state-bridge's markers.
+const SHEET_MARKER = '__lattice_sheet';
 const LOG_PREFIX     = '[MemoryPipeline]';
 
 // =============================================================================
@@ -62,6 +78,10 @@ const DEFAULT_SETTINGS = {
     factsPerCategoryCap: 12,     // v2: hard ceiling per fact-sheet category
     backupsRetention:    0,      // v2: max pre-merge backups kept; 0 = unlimited
     trackedChars:        [],     // avatarUrls of characters the pipeline has run for
+    shelfEnabled:         false, // Phase 4: curiosities/ + outbox/ become memory (kind hands/gift).
+                                 // Requires the companion ticket server's /shelf endpoint —
+                                 // leave off unless you run one (github.com/mlixer/ticket-server).
+    shelfServer:          '',    // blank = auto: loopback locally, :8443 proxy on tailnet
 
     // v2.1: user-editable prompts. Defaults are the shipped prompt
     // templates from summarizer.js VERBATIM, so behavior is unchanged
@@ -86,6 +106,15 @@ const DEFAULT_SETTINGS = {
     // { key, label, description } per category. Renaming a key via the
     // UI migrates existing fact sheets (backup taken first).
     factCategories:      DEFAULT_FACT_CATEGORIES,
+
+    // v3.1: fact-sheet placement + big-run compaction cadence.
+    sheetPosition:         0,   // 0 = pinned at the very top (classic); N>0 = N messages from the end
+    compactEveryNSessions: 0,   // mid-run fact compaction on big runs; 0 = end-of-run only
+
+    // v3 (Memory Lattice): the READ PATH — per-message recall settings.
+    // Defined in reader.js; spread here so getSettings() migration gives
+    // existing installs the new keys without touching anything else.
+    ...DEFAULT_READER_SETTINGS,
 };
 
 // =============================================================================
@@ -170,6 +199,35 @@ function scheduleNextRun(timeString) {
  * @param {string} avatarUrl
  * @returns {Promise<boolean>} - true on success, false on error
  */
+// Phase 4: shelf files -> memory. Explicit setting wins; else mirror state-bridge's
+// location-aware resolution (loopback locally, :8443 proxy on the tailnet).
+function resolveShelfServer() {
+    const explicit = [getSettings().shelfServer, extension_settings.state_bridge?.server]
+        .find((s) => typeof s === 'string' && s.trim());
+    if (explicit) return explicit.trim().replace(/\/+$/, '');
+    const h = location.hostname;
+    if (h === 'localhost' || h === '127.0.0.1') return 'http://127.0.0.1:8002';
+    return `https://${h}:8443`;
+}
+
+async function runShelfStep(characterName, settings) {
+    try {
+        setStatus(`Shelf-ingest for ${characterName}...`);
+        const s = await indexShelfForCharacter(characterName, {
+            serverUrl:      resolveShelfServer(),
+            qdrantPort:     settings.qdrantPort,
+            embeddingPort:  settings.embeddingPort,
+            embeddingModel: settings.embeddingModel,
+            embeddingUrl:   settings.embeddingUrl,
+            embeddingApi:   settings.embeddingApi,
+            vectorSize:     settings.vectorSize,
+        });
+        console.log(`${LOG_PREFIX} Shelf ingest for "${characterName}": ${s.indexed} indexed, ${s.deleted} removed.`);
+    } catch (err) {
+        console.warn(`${LOG_PREFIX} Shelf ingest failed (non-blocking):`, err);
+    }
+}
+
 async function runPipelineForCharacter(characterName, avatarUrl, forceFullReindex = false) {
     const settings = getSettings();
 
@@ -221,15 +279,20 @@ async function runPipelineForCharacter(characterName, avatarUrl, forceFullReinde
                 summarize: settings.summarizePrompt,
                 extract:   settings.extractFactsPrompt,
                 refine:    settings.refinePrompt,
+                compact:   settings.compactPrompt,
             },
             settings.factCategories,
             Math.max(0, (settings.chunkGapHours ?? 0)) * 60 * 60 * 1000,
+            settings.compactEveryNSessions ?? 0,
+            settings.factsPerCategoryCap,
         );
 
         if (summaries.length === 0 && since > 0) {
             setStatus(`No new chats for ${characterName}. Done.`);
-            console.log(`${LOG_PREFIX} No new summaries — skipping index step.`);
-            // No mutation happened → no backup needed → snapshot is discarded.
+            console.log(`${LOG_PREFIX} No new summaries — skipping chat index step.`);
+            // No chat mutation → no backup needed → snapshot is discarded. The shelf
+            // may still have changed, though — it indexes independently of chats.
+            if (settings.shelfEnabled) await runShelfStep(characterName, settings);
             return true;
         }
 
@@ -262,9 +325,16 @@ async function runPipelineForCharacter(characterName, avatarUrl, forceFullReinde
             settings.qdrantPort,
             settings.embeddingPort,
             settings.vectorSize,
-            undefined,        // embeddingModel — use module default
+            settings.embeddingModel,
             since === 0,      // fullWipe only on first run / forced rebuild
+            settings.embeddingUrl,
+            settings.embeddingApi,
         );
+
+        // 4a. (Phase 4) Shelf ingest: the hands' own writing (kind hands/gift) joins this
+        //     same collection. Runs AFTER step 4 so a fullWipe rebuild has already
+        //     cleared + re-inserted chat points. Best-effort — never blocks.
+        if (settings.shelfEnabled) await runShelfStep(characterName, settings);
 
         // 4b. (M2) Consolidation pass: rebuild the derived layer of cross-
         //     session topic memories now that the base points are current.
@@ -276,6 +346,9 @@ async function runPipelineForCharacter(characterName, avatarUrl, forceFullReinde
                 const cRes = await runConsolidation(characterName, {
                     qdrantPort:     settings.qdrantPort,
                     embeddingPort:  settings.embeddingPort,
+                    embeddingModel: settings.embeddingModel,
+                    embeddingUrl:   settings.embeddingUrl,
+                    embeddingApi:   settings.embeddingApi,
                     llmPort:        settings.llmPort,
                     threshold:      settings.consolidationThreshold,
                     minCluster:     settings.consolidationMinCluster,
@@ -385,7 +458,7 @@ function setStatus(message) {
 const SETTINGS_HTML = `
 <div class="inline-drawer" id="memPipeline_settings">
     <div class="inline-drawer-toggle inline-drawer-header">
-        <b>Memory Pipeline</b>
+        <b>Memory Lattice</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
@@ -427,6 +500,46 @@ const SETTINGS_HTML = `
             <label>Vector Size
                 <input type="number" id="memPipeline_vectorSize"
                        class="text_pole" style="width:100%; margin-top:2px;" />
+            </label>
+
+            <label title="Embedding model name, used by BOTH the nightly write path and per-message recall. Changing it requires a Force Full Reindex — mixed-model vectors don't compare.">Embedding Model
+                <input type="text" id="memPipeline_embeddingModel"
+                       class="text_pole" style="width:100%; margin-top:2px;" placeholder="nomic-embed-text" />
+            </label>
+
+            <label title="Wire format of the embedding server: 'ollama' (/api/embeddings) or 'openai' (/v1/embeddings — llama.cpp's server speaks this).">Embedding API (ollama | openai)
+                <input type="text" id="memPipeline_embeddingApi"
+                       class="text_pole" style="width:100%; margin-top:2px;" placeholder="ollama" />
+            </label>
+
+            <label title="Full Qdrant base URL. Blank = http://localhost:&lt;port&gt;. These requests run in YOUR BROWSER, so when ST is loaded from another device, blank points at that device — set a reachable URL for remote use.">Qdrant URL (blank = localhost)
+                <input type="text" id="memPipeline_qdrantUrl"
+                       class="text_pole" style="width:100%; margin-top:2px;" placeholder="http://127.0.0.1:6333" />
+            </label>
+
+            <label title="Full embedding-server base URL. Blank = http://localhost:&lt;port&gt;. Same browser-side caveat as the Qdrant URL.">Embedding URL (blank = localhost)
+                <input type="text" id="memPipeline_embeddingUrl"
+                       class="text_pole" style="width:100%; margin-top:2px;" placeholder="http://127.0.0.1:11434" />
+            </label>
+
+            <label title="Where the fact sheet lands: 0 = pinned at the very top (classic). N&gt;0 = N messages from the end, nearer the current turn.">Fact Sheet Position (0 = top)
+                <input type="number" id="memPipeline_sheetPosition"
+                       class="text_pole" style="width:100%; margin-top:2px;" min="0" max="100" />
+            </label>
+
+            <label title="On long runs (especially Force Full Reindex), compact the fact sheet every N sessions instead of only once at the end — keeps the sheet inside the compaction call's budget. 0 = end-of-run only.">Compact Facts every N Sessions (0 = end only)
+                <input type="number" id="memPipeline_compactEveryNSessions"
+                       class="text_pole" style="width:100%; margin-top:2px;" min="0" max="100" />
+            </label>
+
+            <label>Shelf Server (blank = auto: loopback / :8443)
+                <input type="text" id="memPipeline_shelfServer"
+                       class="text_pole" style="width:100%; margin-top:2px;" placeholder="auto" />
+            </label>
+
+            <label style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="memPipeline_shelfEnabled" />
+                <span>Shelf ingest (curiosities + gifts → memory)</span>
             </label>
 
             <label>Chunk Size (messages)
@@ -499,6 +612,100 @@ const SETTINGS_HTML = `
             </button>
         </div>
 
+
+        <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
+            <button id="memPipeline_editSheet" class="menu_button"
+                    title="Open the current character's fact sheet for direct editing — quick corrections without waiting for the nightly merge. A backup is taken before every save.">
+                &#9998; Edit Fact Sheet (current character)
+            </button>
+        </div>
+        <div id="memPipeline_sheetEditorWrap" style="display:none; margin-bottom:10px;">
+            <div style="font-size:0.8em; opacity:0.7; margin-bottom:4px;">
+                Facts as JSON: { "category": [ { "fact": "...", "added": "YYYY-MM-DD" }, ... ] }.
+                Edit, add, or delete entries. A backup of the current sheet is saved before your edit is written.
+            </div>
+            <textarea id="memPipeline_sheetEditor" class="text_pole" rows="16" spellcheck="false"
+                      style="font-family:monospace; font-size:0.85em;"></textarea>
+            <div style="display:flex; gap:8px; margin-top:6px;">
+                <button id="memPipeline_sheetSave" class="menu_button menu_button_default">Save Fact Sheet</button>
+                <button id="memPipeline_sheetCancel" class="menu_button">Cancel</button>
+            </div>
+        </div>
+
+        <hr style="opacity:0.2; margin:14px 0 10px;">
+        <div style="margin-bottom:10px;">
+            <b>Recall (read path)</b>
+            <div style="font-size:0.8em; opacity:0.7; margin:2px 0 8px;">
+                Per-message memory retrieval. Tune with <b>Preview Recall</b> below — it shows
+                exactly what would be injected, with similarity scores and token cost.
+            </div>
+
+            <div style="display:flex; align-items:center; gap:20px; margin-bottom:10px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:6px;"
+                       title="Master switch for per-message recall. Off = no retrieval, no injection (the fact sheet is controlled separately by the main Enabled toggle).">
+                    <input type="checkbox" id="memPipeline_recallEnabled" />
+                    Inject recalled memories
+                </label>
+                <span style="font-size:0.85em; opacity:0.75;">
+                    Indexed memories: <b id="memPipeline_memoryCount">—</b>
+                    <button id="memPipeline_refreshCount" class="menu_button" style="margin-left:6px;"
+                            title="Count the points in the current character's Qdrant collection.">&#8635;</button>
+                </span>
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px 16px; margin-bottom:10px;">
+                <label title="How many memories are retrieved per message. Fewer = more focused recall and fewer tokens; which ones make the cut is governed by the relevance threshold.">Number of Memories (k)
+                    <input type="number" id="memPipeline_recallK"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="1" max="50" />
+                </label>
+                <label title="Minimum cosine similarity for a memory to be injected at all. Raise it if irrelevant memories sneak in; lower it if obviously-relevant ones go missing. Use Preview Recall to see real scores from your corpus before changing this.">Relevance Threshold (0–1)
+                    <input type="number" id="memPipeline_recallThreshold"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="0" max="1" step="0.05" />
+                </label>
+                <label title="Where the memory block lands: this many messages from the end of the chat. Smaller = closer to the new message (stronger influence).">Memory Position (depth)
+                    <input type="number" id="memPipeline_recallPosition"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="0" max="100" />
+                </label>
+                <label title="How many messages BEFORE your new one are folded into the retrieval query. 0 = embed only the new message. Raise to 1–2 if short follow-ups ('and then?') retrieve poorly.">Retain Recent Messages
+                    <input type="number" id="memPipeline_recallRetainRecent"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="0" max="20" />
+                </label>
+                <label title="Temporal neighbor expansion: each retrieved memory may bring its nearest-in-time neighbors from within ± this many days, so recall arrives with its context attached. 0 disables expansion.">Neighbor Time Window (days)
+                    <input type="number" id="memPipeline_recallNeighborWindowDays"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="0" max="365" />
+                </label>
+                <label title="Upper bound on neighbors brought along per retrieved memory.">Max Neighbors per Match
+                    <input type="number" id="memPipeline_recallNeighborsPerMatch"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="0" max="10" />
+                </label>
+                <label title="Upper bound on neighbors across the whole injection, regardless of per-match allowance.">Max Neighbors Total
+                    <input type="number" id="memPipeline_recallNeighborsTotal"
+                           class="text_pole" style="width:100%; margin-top:2px;" min="0" max="20" />
+                </label>
+            </div>
+
+            <label title="The line that introduces recalled memories to the model. As with every prompt here: once your companion has a settled voice, consider asking it to rewrite this in its own words.">Recall header
+                <textarea id="memPipeline_recallHeader" class="text_pole" rows="2" spellcheck="false"></textarea>
+            </label>
+
+            <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
+                <button id="memPipeline_testQdrant" class="menu_button"
+                        title="Checks that Qdrant answers at the configured port.">Test Qdrant</button>
+                <button id="memPipeline_testEmbedding" class="menu_button"
+                        title="Sends a tiny embedding request and reports the vector size (should match Vector Size above).">Test Embedding</button>
+            </div>
+
+            <div style="display:flex; gap:8px; margin-bottom:6px;">
+                <input type="text" id="memPipeline_previewQuery" class="text_pole" style="flex:1;"
+                       placeholder="Type a test question, e.g. 'what did we do the day we finished the deck project?'" />
+                <button id="memPipeline_previewRecall" class="menu_button menu_button_default"
+                        title="Runs the full read path for this query — retrieval, threshold, neighbor expansion — and shows what WOULD be injected, with scores and token cost. Nothing is sent to the model.">Preview Recall</button>
+                <button id="memPipeline_previewWide" class="menu_button"
+                        title="Zoomed-out tuning view: top 20 memories by raw similarity, IGNORING your threshold and k, below-threshold items flagged. Use this to see where a memory you KNOW is relevant actually ranks.">Wide (top 20)</button>
+            </div>
+            <pre id="memPipeline_previewOutput"
+                 style="display:none; white-space:pre-wrap; font-size:0.8em; max-height:300px; overflow-y:auto; border:1px solid rgba(128,128,128,0.3); border-radius:4px; padding:8px; margin:0 0 6px;"></pre>
+        </div>
 
         <details id="memPipeline_advanced" style="margin:12px 0;">
             <summary><b>Advanced: Prompts &amp; Fact Categories</b></summary>
@@ -705,11 +912,30 @@ function syncUiFromSettings() {
     get('memPipeline_embeddingPort').value          = s.embeddingPort;
     get('memPipeline_qdrantPort').value             = s.qdrantPort;
     get('memPipeline_vectorSize').value             = s.vectorSize;
+    get('memPipeline_embeddingModel').value         = s.embeddingModel;
+    get('memPipeline_embeddingApi').value           = s.embeddingApi;
+    get('memPipeline_qdrantUrl').value              = s.qdrantUrl;
+    get('memPipeline_embeddingUrl').value           = s.embeddingUrl;
+    get('memPipeline_sheetPosition').value          = s.sheetPosition;
+    get('memPipeline_compactEveryNSessions').value  = s.compactEveryNSessions;
     get('memPipeline_chunkSize').value              = s.chunkSize;
     get('memPipeline_chunkGapHours').value          = s.chunkGapHours;
     get('memPipeline_scheduledTime').value          = s.scheduledTime;
     get('memPipeline_factsPerCategoryCap').value    = s.factsPerCategoryCap;
     get('memPipeline_backupsRetention').value       = s.backupsRetention;
+    get('memPipeline_shelfEnabled').checked         = s.shelfEnabled;
+    get('memPipeline_shelfServer').value            = s.shelfServer;
+
+    // Recall (read path)
+    get('memPipeline_recallEnabled').checked             = s.recallEnabled;
+    get('memPipeline_recallK').value                     = s.recallK;
+    get('memPipeline_recallThreshold').value             = s.recallThreshold;
+    get('memPipeline_recallPosition').value              = s.recallPosition;
+    get('memPipeline_recallRetainRecent').value          = s.recallRetainRecent;
+    get('memPipeline_recallNeighborWindowDays').value    = s.recallNeighborWindowDays;
+    get('memPipeline_recallNeighborsPerMatch').value     = s.recallNeighborsPerMatch;
+    get('memPipeline_recallNeighborsTotal').value        = s.recallNeighborsTotal;
+    get('memPipeline_recallHeader').value                = s.recallHeader;
 
     get('memPipeline_consolidationEnabled').checked     = s.consolidationEnabled;
     get('memPipeline_consolidationThreshold').value      = s.consolidationThreshold;
@@ -770,7 +996,44 @@ async function syncSettingsFromUi() {
     s.embeddingPort        = parseInt(get('memPipeline_embeddingPort').value, 10)        || DEFAULT_SETTINGS.embeddingPort;
     s.qdrantPort           = parseInt(get('memPipeline_qdrantPort').value, 10)           || DEFAULT_SETTINGS.qdrantPort;
     s.vectorSize           = parseInt(get('memPipeline_vectorSize').value, 10)           || DEFAULT_SETTINGS.vectorSize;
+    s.embeddingModel       = (get('memPipeline_embeddingModel').value || '').trim() || DEFAULT_READER_SETTINGS.embeddingModel;
+    s.embeddingApi         = ((get('memPipeline_embeddingApi').value || '').trim().toLowerCase() === 'openai') ? 'openai' : 'ollama';
+    s.qdrantUrl            = (get('memPipeline_qdrantUrl').value || '').trim().replace(/\/+$/, '');
+    s.embeddingUrl         = (get('memPipeline_embeddingUrl').value || '').trim().replace(/\/+$/, '');
     s.chunkSize            = parseInt(get('memPipeline_chunkSize').value, 10)            || DEFAULT_SETTINGS.chunkSize;
+
+    s.shelfEnabled         = get('memPipeline_shelfEnabled').checked;
+    s.shelfServer          = get('memPipeline_shelfServer').value.trim();
+
+    // --- Recall (read path) knobs. Zero is legitimate for several of
+    //     these (position 0, retain 0, window 0 = expansion off), so use
+    //     the Number+isFinite idiom rather than ||-fallbacks. ---
+    s.recallEnabled = get('memPipeline_recallEnabled').checked;
+
+    const readIntMin0 = (id, fallback) => {
+        const raw = parseInt(get(id)?.value, 10);
+        return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+    };
+    s.recallK                     = parseInt(get('memPipeline_recallK').value, 10) || DEFAULT_READER_SETTINGS.recallK;
+    s.sheetPosition               = readIntMin0('memPipeline_sheetPosition',           DEFAULT_SETTINGS.sheetPosition);
+    s.compactEveryNSessions       = readIntMin0('memPipeline_compactEveryNSessions',   DEFAULT_SETTINGS.compactEveryNSessions);
+    s.recallPosition              = readIntMin0('memPipeline_recallPosition',           DEFAULT_READER_SETTINGS.recallPosition);
+    s.recallRetainRecent          = readIntMin0('memPipeline_recallRetainRecent',       DEFAULT_READER_SETTINGS.recallRetainRecent);
+    s.recallNeighborWindowDays    = readIntMin0('memPipeline_recallNeighborWindowDays', DEFAULT_READER_SETTINGS.recallNeighborWindowDays);
+    s.recallNeighborsPerMatch     = readIntMin0('memPipeline_recallNeighborsPerMatch',  DEFAULT_READER_SETTINGS.recallNeighborsPerMatch);
+    s.recallNeighborsTotal        = readIntMin0('memPipeline_recallNeighborsTotal',     DEFAULT_READER_SETTINGS.recallNeighborsTotal);
+
+    const recallThrRaw = parseFloat(get('memPipeline_recallThreshold').value);
+    s.recallThreshold = (Number.isFinite(recallThrRaw) && recallThrRaw >= 0 && recallThrRaw <= 1)
+        ? recallThrRaw
+        : DEFAULT_READER_SETTINGS.recallThreshold;
+
+    // (Self-contained read — the shared readPrompt helper is declared
+    //  further down this function and isn't in scope yet at this point.)
+    const recallHeaderRaw = get('memPipeline_recallHeader')?.value ?? '';
+    s.recallHeader = recallHeaderRaw.trim().length > 0
+        ? recallHeaderRaw
+        : DEFAULT_READER_SETTINGS.recallHeader;
 
     // chunkGapHours: 0 is a legitimate value (= disabled), so use the
     // Number+isFinite idiom like backupsRetention, not the ||-fallback.
@@ -962,6 +1225,9 @@ function bindUiEvents() {
                 const cRes = await runConsolidation(target.charName, {
                     qdrantPort:     settings.qdrantPort,
                     embeddingPort:  settings.embeddingPort,
+                    embeddingModel: settings.embeddingModel,
+                    embeddingUrl:   settings.embeddingUrl,
+                    embeddingApi:   settings.embeddingApi,
                     llmPort:        settings.llmPort,
                     threshold:      settings.consolidationThreshold,
                     minCluster:     settings.consolidationMinCluster,
@@ -974,6 +1240,130 @@ function bindUiEvents() {
                 setStatus(`Consolidation error: ${err.message}`);
             }
             setRunButtonsDisabled(false);
+        });
+
+    // --- Recall (read path): connection tests, count display, preview ---
+
+    document.getElementById('memPipeline_testQdrant')
+        ?.addEventListener('click', async () => {
+            setStatus('Testing Qdrant connection...');
+            const res = await testQdrantConnection(getSettings().qdrantPort, getSettings().qdrantUrl);
+            setStatus(`${res.ok ? '✓' : '✗'} ${res.detail}`);
+        });
+
+    document.getElementById('memPipeline_testEmbedding')
+        ?.addEventListener('click', async () => {
+            setStatus('Testing embedding endpoint...');
+            const s2 = getSettings();
+            const res = await testEmbeddingConnection(s2.embeddingPort, s2.embeddingModel, s2.embeddingUrl, s2.embeddingApi);
+            setStatus(`${res.ok ? '✓' : '✗'} ${res.detail}`);
+        });
+
+    const refreshMemoryCount = async () => {
+        const countEl = document.getElementById('memPipeline_memoryCount');
+        if (!countEl) return;
+        // Quiet character resolution — no status-line nagging on page load.
+        const context = getContext();
+        const char    = context.characters?.[context.characterId];
+        const target  = char?.name ? { charName: char.name } : null;
+        if (!target) { countEl.textContent = '—'; return; }
+        try {
+            const n = await countMemories(target.charName, getSettings().qdrantPort, getSettings().qdrantUrl);
+            countEl.textContent = (n === null)
+                ? 'no collection yet'
+                : String(n);
+        } catch {
+            countEl.textContent = 'unreachable';
+        }
+    };
+    document.getElementById('memPipeline_refreshCount')
+        ?.addEventListener('click', refreshMemoryCount);
+    // Populate once on load, quietly.
+    refreshMemoryCount();
+
+    const runPreview = async (wide) => {
+        const target = getCurrentCharacter();
+        if (!target) return;
+
+        const query = document.getElementById('memPipeline_previewQuery')?.value?.trim();
+        if (!query) { setStatus('Type a test query first.'); return; }
+
+        const out = document.getElementById('memPipeline_previewOutput');
+        setStatus(wide ? 'Running WIDE preview (top 20, no threshold)...' : 'Running recall preview...');
+        try {
+            const { report } = await previewRecall(query, target.charName, getSettings(), wide);
+            if (out) { out.textContent = report; out.style.display = 'block'; }
+            setStatus('Preview complete — nothing was sent to the model.');
+        } catch (err) {
+            if (out) { out.textContent = `Preview failed: ${err.message}`; out.style.display = 'block'; }
+            setStatus(`Preview error: ${err.message}`);
+        }
+    };
+    document.getElementById('memPipeline_previewRecall')
+        ?.addEventListener('click', () => runPreview(false));
+    document.getElementById('memPipeline_previewWide')
+        ?.addEventListener('click', () => runPreview(true));
+
+    // --- Fact-sheet editor: quick corrections, backup before every save ---
+    let sheetBeingEdited = null;   // { avatarUrl, sheet } while the editor is open
+    const sheetWrap = () => document.getElementById('memPipeline_sheetEditorWrap');
+    const sheetArea = () => document.getElementById('memPipeline_sheetEditor');
+
+    document.getElementById('memPipeline_editSheet')
+        ?.addEventListener('click', async () => {
+            const target = getCurrentCharacter();
+            if (!target) return;
+            try {
+                const sheet = await loadFactSheet(target.avatarUrl);
+                if (!sheet) { setStatus('No fact sheet yet for this character — run the pipeline first.'); return; }
+                sheetBeingEdited = { avatarUrl: target.avatarUrl, sheet };
+                sheetArea().value = JSON.stringify(sheet.facts ?? {}, null, 2);
+                sheetWrap().style.display = 'block';
+                setStatus(`Editing fact sheet for ${target.charName}. Save takes a backup first.`);
+            } catch (err) {
+                setStatus(`Could not load fact sheet: ${err.message}`);
+            }
+        });
+
+    document.getElementById('memPipeline_sheetCancel')
+        ?.addEventListener('click', () => {
+            sheetBeingEdited = null;
+            sheetWrap().style.display = 'none';
+            setStatus('Fact-sheet edit cancelled — nothing changed.');
+        });
+
+    document.getElementById('memPipeline_sheetSave')
+        ?.addEventListener('click', async () => {
+            if (!sheetBeingEdited) return;
+            let parsed;
+            try {
+                parsed = JSON.parse(sheetArea().value);
+            } catch (err) {
+                setStatus(`Not valid JSON — nothing saved. (${err.message})`); return;
+            }
+            // Shape check: object of arrays of {fact: string, added: string}.
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+                setStatus('Top level must be an object of categories — nothing saved.'); return;
+            }
+            for (const [cat, arr] of Object.entries(parsed)) {
+                if (!Array.isArray(arr)) { setStatus(`Category "${cat}" must be an array — nothing saved.`); return; }
+                for (const e of arr) {
+                    if (typeof e?.fact !== 'string' || typeof e?.added !== 'string') {
+                        setStatus(`Every entry in "${cat}" needs string "fact" and "added" — nothing saved.`); return;
+                    }
+                }
+            }
+            try {
+                const { avatarUrl, sheet } = sheetBeingEdited;
+                await backupFactSheet(avatarUrl, JSON.parse(JSON.stringify(sheet)));
+                sheet.facts = parsed;
+                await saveFactSheet(avatarUrl, sheet);
+                sheetBeingEdited = null;
+                sheetWrap().style.display = 'none';
+                setStatus('Fact sheet saved (backup of the previous version taken). Injects from the next message.');
+            } catch (err) {
+                setStatus(`Save failed: ${err.message}`);
+            }
         });
 }
 
@@ -1020,13 +1410,16 @@ async function init() {
 //
 // Registered via manifest.json's "generate_interceptor": "memoryPipelineInterceptor".
 // ST calls this hook on every generation, before sending the prompt to the
-// model. We load the current character's fact sheet and prepend it as a
-// system message at the top of the chat array.
+// model. Both halves of the Lattice's per-message injection happen here:
 //
-// This pairs with the Qdrant Memory extension's own interceptor — they both
-// fire (ST calls each registered interceptor in turn), so the fact sheet
-// gets pinned at the top and Qdrant Memory's retrieved summaries get injected
-// based on relevance. Together they form the hybrid memory system.
+//   1. READ PATH (reader.js): the outgoing message is embedded, relevant
+//      memories (and their temporal neighbors) are retrieved from Qdrant,
+//      and the rendered block is spliced in at the configured depth. Shelf
+//      entries (kind 'hands'/'gift') live in the same collection, so the
+//      hands' offline writing surfaces through the same recall.
+//   2. FACT SHEET: the current character's fact sheet is prepended as a
+//      system message at the very top — identity and current state are
+//      never a retrieval gamble.
 //
 // Performance note: we load the fact sheet from disk on every message. This
 // is a single small JSON file fetched from a local endpoint, so the latency
@@ -1034,15 +1427,33 @@ async function init() {
 // add a per-character cache invalidated whenever finaliseAndSave runs.
 // =============================================================================
 
-async function memoryPipelineInterceptor(chat, _contextSize, _abort, _type) {
-    try {
-        const settings = getSettings();
-        if (!settings.enabled) return;
+async function memoryPipelineInterceptor(chat, _contextSize, _abort, type) {
+    const settings = getSettings();
+    if (!settings.enabled) return;
 
-        const context = getContext();
-        const characters = context.characters ?? [];
-        const character = characters[context.characterId];
-        if (!character?.avatar) return; // group chat, or no character selected
+    const context = getContext();
+    const characters = context.characters ?? [];
+    const character = characters[context.characterId];
+    if (!character?.avatar) return; // group chat, or no character selected
+
+    // --- READ PATH: recalled memories, spliced at the configured depth. ---
+    // Runs FIRST so the fact sheet's unshift below always lands on top.
+    // Best-effort: any recall failure degrades to fact-sheet-only.
+    try {
+        const injectedTokens = await injectRecalledMemories(
+            chat, character.name, settings, type);
+        if (injectedTokens > 0) {
+            console.log(`${LOG_PREFIX} Recall injected (~${injectedTokens} tokens).`);
+        }
+    } catch (err) {
+        console.warn(`${LOG_PREFIX} Recall failed (non-blocking):`, err);
+    }
+
+    // --- Fact sheet: identity and current state. ---
+    try {
+        // Double-call guard (same class as the reader's and state-bridge's):
+        // a second interceptor invocation must not unshift the sheet twice.
+        if (chat.some(m => m && m[SHEET_MARKER])) return;
 
         const sheet = await loadFactSheet(character.avatar);
         if (!sheet) return; // no fact sheet yet — pipeline hasn't run for this character
@@ -1050,16 +1461,25 @@ async function memoryPipelineInterceptor(chat, _contextSize, _abort, _type) {
         const formatted = formatFactSheetForContext(sheet, getSettings().factCategories);
         if (!formatted) return; // sheet exists but is empty
 
-        // Insert as a system message at position 0. This pins it ahead of any
-        // other interceptor's injections AND ahead of the actual chat history,
-        // so the model sees it as durable foundational context.
-        chat.unshift({
+        const entry = {
             is_user:   false,
             is_system: true,
             name:      'System',
             mes:       formatted,
             send_date: new Date().toISOString(),
-        });
+            [SHEET_MARKER]: true,
+        };
+        const pos = Math.max(0, settings.sheetPosition ?? 0);
+        if (pos === 0) {
+            // Classic: pinned at the very top, ahead of every other injection —
+            // durable foundational context.
+            chat.unshift(entry);
+        } else {
+            // N messages from the end, nearer the turn being generated.
+            const at = Math.max(0, chat.length - Math.min(chat.length, pos));
+            chat.splice(at, 0, entry);
+            console.log(`${LOG_PREFIX} fact sheet spliced at index ${at} of ${chat.length - 1} (sheetPosition ${pos}).`);
+        }
     } catch (err) {
         // An injection failure must NEVER block generation. Log and continue.
         console.warn(`${LOG_PREFIX} Fact sheet injection failed:`, err);

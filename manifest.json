@@ -1,13 +1,13 @@
 {
-    "display_name": "Memory Pipeline",
+    "display_name": "Memory Lattice",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "generate_interceptor": "memoryPipelineInterceptor",
-    "author": "",
-    "version": "1.0.0",
-    "homePage": "",
+    "author": "mlixer",
+    "version": "3.1.0",
+    "homePage": "https://github.com/mlixer/memory-lattice",
     "auto_update": false
 }

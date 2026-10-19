@@ -94,24 +94,56 @@ function deriveCollectionName(characterName) {
  * @param {string} embeddingModel  - Model name (required by Ollama)
  * @returns {Promise<number[]>}    - The embedding vector
  */
-async function embedText(text, embeddingPort = DEFAULT_EMBEDDING_PORT, embeddingModel = DEFAULT_EMBEDDING_MODEL) {
-    const url = `http://localhost:${embeddingPort}/api/embeddings`;
+async function embedText(
+    text,
+    embeddingPort = DEFAULT_EMBEDDING_PORT,
+    embeddingModel = DEFAULT_EMBEDDING_MODEL,
+    embeddingUrl = '',
+    embeddingApi = 'ollama',
+) {
+    // Base URL: explicit setting wins (any host/scheme); blank = loopback.
+    // These fetches run in the BROWSER, so loopback means "the device
+    // browsing ST" — a remote/tailnet browser needs embeddingUrl set.
+    const base = (embeddingUrl || `http://localhost:${embeddingPort}`).replace(/\/+$/, '');
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            model: embeddingModel,
-            prompt: text,
-        }),
-    });
+    // Two wire formats:
+    //   ollama: POST /api/embeddings {model, prompt} -> {embedding: [...]}
+    //   openai: POST /v1/embeddings  {model, input}  -> {data: [{embedding: [...]}]}
+    // (llama.cpp's server speaks the openai format — switch the drawer's
+    // Embedding API setting when migrating the embedder to llama.cpp.)
+    const openai = String(embeddingApi).toLowerCase() === 'openai';
+    const url  = openai ? `${base}/v1/embeddings` : `${base}/api/embeddings`;
+    const body = openai ? { model: embeddingModel, input: text }
+                        : { model: embeddingModel, prompt: text };
+
+    // Timeout guard: a wedged embedding server once froze a full-reindex run
+    // for hours on one hung request (fetch has NO default timeout). Two
+    // minutes is geological time for one embedding; after that, abort so the
+    // caller's per-summary catch can skip and the run keeps moving.
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 120_000);
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: abort.signal,
+        });
+    } catch (err) {
+        throw err.name === 'AbortError'
+            ? new Error(`${LOG_PREFIX} Embedding request timed out after 120s (server wedged?)`)
+            : err;
+    } finally {
+        clearTimeout(timer);
+    }
 
     if (!response.ok) {
         throw new Error(`${LOG_PREFIX} Embedding API error: HTTP ${response.status}`);
     }
 
     const data = await response.json();
-    const vector = data?.embedding;
+    const vector = openai ? data?.data?.[0]?.embedding : data?.embedding;
 
     if (!Array.isArray(vector) || vector.length === 0) {
         throw new Error(`${LOG_PREFIX} Embedding API returned empty or invalid vector.`);
@@ -322,6 +354,8 @@ async function indexSummaries(
     vectorSize      = DEFAULT_VECTOR_SIZE,
     embeddingModel  = DEFAULT_EMBEDDING_MODEL,
     fullWipe        = true,
+    embeddingUrl    = '',
+    embeddingApi    = 'ollama',
 ) {
     if (!summaries || summaries.length === 0) {
         console.log(`${LOG_PREFIX} No summaries to index for "${characterName}".`);
@@ -357,11 +391,27 @@ async function indexSummaries(
 
         let vector;
         try {
-            vector = await embedText(summary.text, embeddingPort, embeddingModel);
+            vector = await embedText(summary.text, embeddingPort, embeddingModel, embeddingUrl, embeddingApi);
         } catch (err) {
             // A single failed embedding should not abort the whole index run.
             console.warn(`${LOG_PREFIX} Skipping summary ${i + 1} — embedding failed: ${err.message}`);
             continue;
+        }
+
+        // Dimension tripwire — deliberately OUTSIDE the skip-and-continue
+        // above. A wrong-sized vector means the request reached the WRONG
+        // EMBEDDING SERVER or model (stale tab settings, wrong URL): every
+        // subsequent embed would be equally wrong, so abort the whole index
+        // step immediately and loudly rather than discovering it at upsert
+        // time — or never.
+        if (vector.length !== vectorSize) {
+            throw new Error(
+                `${LOG_PREFIX} Embedding dimension mismatch on summary ${i + 1}: ` +
+                `got ${vector.length}, expected ${vectorSize}. The embedding requests are ` +
+                `reaching the wrong server or model — check Embedding URL/API/Model and ` +
+                `that THIS tab was loaded after the settings were saved. Index step aborted; ` +
+                `no points were written.`
+            );
         }
 
         // Qdrant point IDs must be unsigned integers or UUIDs.

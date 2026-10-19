@@ -303,6 +303,8 @@ async function runConsolidation(characterName, {
     qdrantPort     = DEFAULT_QDRANT_PORT,
     embeddingPort  = DEFAULT_EMBEDDING_PORT,
     embeddingModel = DEFAULT_EMBEDDING_MODEL,
+    embeddingUrl   = '',
+    embeddingApi   = 'ollama',
     llmPort        = 8070,
     threshold      = 0.80,
     minCluster     = 3,
@@ -361,7 +363,7 @@ async function runConsolidation(characterName, {
 
         let vector;
         try {
-            vector = await embedText(text, embeddingPort, embeddingModel);
+            vector = await embedText(text, embeddingPort, embeddingModel, embeddingUrl, embeddingApi);
         } catch (err) {
             console.warn(`${LOG_PREFIX} Cluster ${i + 1} embedding failed: ${err.message}. Skipping cluster.`);
             continue;

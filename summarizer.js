@@ -1292,9 +1292,16 @@ async function runPipeline(
     port = 8070,
     existingFactSheet = null,
     refineSummaries = true,
-    promptOverrides = null,   // { summarize, extract, refine } — strings or null
+    promptOverrides = null,   // { summarize, extract, refine, compact } — strings or null
     categories = null,        // active category list from settings
     chunkGapMs = 0,           // M4: split chunks on real-time gaps (0 = off)
+    compactEveryNSessions = 0,  // v3.1: mid-run fact-sheet compaction cadence.
+                                // On a full reindex, 150+ days of facts accumulate
+                                // before the single end-of-run compaction — a sheet
+                                // too big for one compaction call's budget. N > 0
+                                // compacts every N sessions, keeping the sheet
+                                // bounded throughout. 0 = end-of-run only (v3.0).
+    factsPerCategoryCap = 12,   // cap handed to those mid-run compactions
 ) {
     console.log(`${LOG_PREFIX} Starting pipeline for "${characterName}"...`);
 
@@ -1307,6 +1314,7 @@ async function runPipeline(
 
     const summaries = [];
     let factSheet = existingFactSheet;
+    let sessionsSinceCompact = 0;
 
     for (const session of sessions) {
         const chunks = chunkSession(session.messages, chunkSize, chunkGapMs);
@@ -1360,6 +1368,17 @@ async function runPipeline(
                 timestampMs: chunkTimestamps[s.chunkIndex] ?? session.lastModified,
                 text:        s.text,
             });
+        }
+
+        // v3.1: periodic mid-run compaction. Best-effort like the final one —
+        // compactFactSheet falls back to its input on any failure, so this can
+        // only ever bound the sheet, never lose it.
+        sessionsSinceCompact++;
+        if (compactEveryNSessions > 0 && sessionsSinceCompact >= compactEveryNSessions && factSheet) {
+            console.log(`${LOG_PREFIX} Mid-run fact-sheet compaction (every ${compactEveryNSessions} session(s))...`);
+            factSheet = await compactFactSheet(
+                factSheet, factsPerCategoryCap, port, promptOverrides?.compact, categories);
+            sessionsSinceCompact = 0;
         }
     }
 
